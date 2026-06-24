@@ -1,0 +1,432 @@
+import asyncio
+import json
+import os
+import random
+from typing import Set, List, Dict, Optional
+from core.event_bus import EventBus
+from core.ngfw import PolicyEngine, SecurityRule
+from datetime import datetime
+
+RULES_FILE = "firewall_rules.json"
+
+class FirewallService:
+    def __init__(self, bus: EventBus):
+        self.bus = bus
+        self.active = True
+        self.auto_block_enabled = True
+        self.panic_mode = False
+        
+        # Legacy/Simple Blocks (Phase 1 & 2)
+        self.blocked_ips: Set[str] = set()
+        self.blocked_ports: Set[int] = set()
+        self.blocked_countries: Set[str] = set()
+        
+        # NGFW Engine (Phase 3)
+        self.ngfw = PolicyEngine()
+        
+        # Zero Trust Identity (Phase 4)
+        from core.process_identity import ProcessIdentity
+        self.identity = ProcessIdentity()
+        
+        # Threat Intel (Phase 7)
+        from core.threat_intel import ThreatIntelService
+        self.threat_intel = ThreatIntelService()
+        
+        self.whitelist_ips: Set[str] = {"127.0.0.1", "localhost"}
+        # Keeping rule metadata for simple blocks to show in UI
+        self.simple_rules: Dict[str, Dict] = {} 
+        
+        self.load_rules()
+        self.bus.subscribe("command", self.handle_command)
+
+    async def handle_command(self, event: Dict):
+        """
+        Handle commands from SOAR or other components.
+        """
+        cmd = event.get("cmd")
+        print(f"[FIREWALL] Received Command: {cmd}")
+        
+        if cmd == "panic_mode":
+            enabled = event.get("enabled", True)
+            await self.toggle_panic_mode(enabled)
+        
+        elif cmd == "block_ip":
+            ip = event.get("ip")
+            if ip:
+                await self.block_ip(ip, reason="Automated Command")
+
+        elif cmd == "block_port":
+            port = event.get("port")
+            if port:
+                await self.block_port(int(port), reason="Automated Command")
+
+    def simulate_app_id(self, port: int) -> str:
+        """
+        Simulate App-ID classification based on port and entropy.
+        """
+        if port == 80: return "web-browsing"
+        if port == 443: return "ssl"
+        if port == 22: return "ssh"
+        if port == 53: return "dns"
+        if port == 3389: return "rdp"
+        if port == 3306: return "mysql"
+        return "unknown-tcp"
+
+    def match_traffic(self, ip: str, port: int, country: str = "US", pid: int = None) -> str:
+        """
+        Master evaluation logic.
+        Returns: 'allow' or 'deny'
+        """
+        # 1. Panic Mode Override
+        if self.panic_mode and ip not in self.whitelist_ips:
+            return "deny"
+
+        # 2. Geo-Blocking Override
+        if country in self.blocked_countries:
+            return "deny"
+
+        # 3. Threat Intelligence Check
+        try:
+             # Check if IP is in global threat feeds if module is loaded
+             threat_status = self.threat_intel.check_ip(ip)
+             if threat_status["malicious"]:
+                 return "deny"
+        except:
+             pass
+
+        # 4. Simple Block Lists (Legacy Support)
+        if ip in self.blocked_ips:
+            return "deny"
+        if self.auto_block_enabled:
+             # Basic Auto Block Logic could go here
+             pass
+
+        # 5. NGFW Policy Engine
+        # Resolve Process Identity (Zero Trust)
+        process_name = "unknown"
+        if pid:
+            info = self.identity.get_process_info(pid)
+            if info:
+                 process_name = info["name"]
+
+        # Simulate Zone resolution
+        src_zone = "Trust" if ip.startswith("192.168") else "Untrust"
+        dst_zone = "DMZ" 
+        app = self.simulate_app_id(port)
+        
+        return self.ngfw.evaluate(src_zone, dst_zone, ip, app, process_name)
+
+    def load_rules(self):
+        if os.path.exists(RULES_FILE):
+            try:
+                with open(RULES_FILE, "r") as f:
+                    data = json.load(f)
+                    self.active = data.get("active", True)
+                    self.auto_block_enabled = data.get("auto_block_enabled", True)
+                    self.panic_mode = data.get("panic_mode", False)
+                    self.blocked_ips = set(data.get("blocked_ips", []))
+                    self.blocked_ports = set(data.get("blocked_ports", []))
+                    self.blocked_countries = set(data.get("blocked_countries", []))
+                    self.simple_rules = data.get("simple_rules", {})
+                    
+                    # Load NGFW Policies
+                    if "policies" in data:
+                        self.ngfw.load_rules(data["policies"])
+                    else:
+                        # Add default 'Allow All' rule if empty upgrade
+                        if not self.ngfw.rules:
+                            self.ngfw.add_rule(SecurityRule("Default Allow", "any", "any", "any", "any", "allow"))
+
+                    print(f"[FIREWALL] Loaded rules. Policies: {len(self.ngfw.rules)}")
+            except Exception as e:
+                print(f"[FIREWALL] Error loading rules: {e}")
+
+    def save_rules(self):
+        try:
+            data = {
+                "active": self.active,
+                "auto_block_enabled": self.auto_block_enabled,
+                "panic_mode": self.panic_mode,
+                "blocked_ips": list(self.blocked_ips),
+                "blocked_ports": list(self.blocked_ports),
+                "blocked_countries": list(self.blocked_countries),
+                "simple_rules": self.simple_rules,
+                "policies": self.ngfw.get_rules_dict()
+            }
+            with open(RULES_FILE, "w") as f:
+                json.dump(data, f, indent=4)
+        except Exception as e:
+            print(f"[FIREWALL] Error saving rules: {e}")
+
+    # --- Policy Management API Methods ---
+
+    async def add_policy(self, policy_data: dict):
+        rule = SecurityRule.from_dict(policy_data)
+        self.ngfw.add_rule(rule)
+        self.save_rules()
+        
+        # Enforce Policy via Netsh (Best Effort)
+        cmds = await self._policy_to_netsh(rule)
+        for cmd in cmds:
+            await self._execute_netsh(cmd)
+
+        await self.bus.publish("firewall_event", {
+            "type": "policy_updated",
+            "policies": self.ngfw.get_rules_dict()
+        })
+        return {"status": "success", "policy": rule.to_dict()}
+
+    async def delete_policy(self, rule_id: str):
+        # We need the rule object to know what to delete, but PolicyEngine removes it by ID.
+        # Find it first
+        rule_to_delete = next((r for r in self.ngfw.rules if r.id == rule_id), None)
+        
+        self.ngfw.remove_rule(rule_id)
+        self.save_rules()
+        
+        if rule_to_delete:
+             # Try to delete the netsh rule by name
+             name = f"Sentinel_Pol_{rule_to_delete.id[:8]}"
+             cmd = f"netsh advfirewall firewall delete rule name=\"{name}\""
+             await self._execute_netsh(cmd)
+
+        await self.bus.publish("firewall_event", {
+            "type": "policy_updated",
+            "policies": self.ngfw.get_rules_dict()
+        })
+        return {"status": "success", "deleted": rule_id}
+
+    def get_policies(self):
+        return self.ngfw.get_rules_dict()
+
+    # --- Existing Methods (Forwarded/Modified) ---
+
+    async def toggle_firewall(self, active: bool):
+        self.active = active
+        self.save_rules()
+        await self.bus.publish("firewall_event", {
+            "type": "status_change",
+            "active": self.active,
+            "panic_mode": self.panic_mode,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        return {"status": "success", "active": self.active}
+
+    async def toggle_panic_mode(self, enabled: bool):
+        self.panic_mode = enabled
+        self.save_rules()
+        msg = "FIREWALL LOCKDOWN INITIATED. BLOCKING ALL TRAFFIC." if enabled else "Firewall Lockdown lifted."
+        level = "CRITICAL" if enabled else "INFO"
+        await self.bus.publish("firewall_event", {
+            "type": "panic_change",
+            "panic_mode": self.panic_mode,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        await self.bus.publish("alert", {
+            "message": msg,
+            "level": level,
+            "severity": "high",
+            "source": "Firewall Core"
+        })
+        return {"status": "success", "panic_mode": self.panic_mode}
+
+    async def toggle_auto_block(self, enabled: bool):
+        self.auto_block_enabled = enabled
+        self.save_rules()
+        await self.bus.publish("firewall_event", {
+            "type": "config_change",
+            "auto_block": self.auto_block_enabled,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        return {"status": "success", "auto_block": self.auto_block_enabled}
+
+    async def _execute_netsh(self, cmd: str):
+        """Helper to run netsh commands safely."""
+        try:
+            # We use create_subprocess_shell for non-blocking execution
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                print(f"[FIREWALL] Netsh Failed: {stderr.decode().strip()}")
+                return False
+            return True
+        except Exception as e:
+            print(f"[FIREWALL] Netsh Exception: {e}")
+            return False
+
+    async def _policy_to_netsh(self, rule) -> List[str]:
+        """Translates a logical SecurityRule to Windows Firewall commands."""
+        cmds = []
+        name = f"Sentinel_Pol_{rule.id[:8]}"
+        action = "block" if rule.action == "deny" else "allow"
+        
+        # We can only map simple L3/L4 rules to netsh easily
+        # App-ID won't map directly without calling DPI (which is WFP only)
+        # So we map IP and Port
+        
+        remote_ip = rule.source_ip if rule.source_ip != "any" else "any"
+        
+        # Map App to Port (Heuristic)
+        local_port = "any"
+        if rule.app == "web-browsing": local_port = "80"
+        elif rule.app == "ssl": local_port = "443"
+        elif rule.app == "ssh": local_port = "22"
+        elif rule.app == "dns": local_port = "53"
+        
+        # Construct Netsh Command
+        # netsh advfirewall firewall add rule name="..." dir=in action=block remoteip=... localport=... protocol=TCP
+        
+        base_cmd = f"netsh advfirewall firewall add rule name=\"{name}\" dir=in action={action}"
+        
+        if remote_ip != "any":
+            base_cmd += f" remoteip={remote_ip}"
+        
+        if local_port != "any":
+            # Add TCP Rule
+            cmds.append(f"{base_cmd} protocol=TCP localport={local_port}")
+            # Add UDP Rule if applicable
+            cmds.append(f"{base_cmd} protocol=UDP localport={local_port}")
+        else:
+            # Any port
+             cmds.append(f"{base_cmd} protocol=any")
+             
+        return cmds
+
+    async def block_ip(self, ip: str, reason: str = "Manual Block"):
+        if ip not in self.blocked_ips:
+            self.blocked_ips.add(ip)
+            
+            # Execute Native Windows Block (Best Effort)
+            cmd1 = f"netsh advfirewall firewall add rule name=\"Sentinel_Block_IP_{ip}\" dir=in action=block remoteip={ip}"
+            await self._execute_netsh(cmd1)
+            cmd2 = f"netsh advfirewall firewall add rule name=\"Sentinel_Block_IP_{ip}\" dir=out action=block remoteip={ip}"
+            await self._execute_netsh(cmd2)
+
+            self.simple_rules[f"ip:{ip}"] = {
+                "target": ip,
+                "type": "IP",
+                "reason": reason,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            self.save_rules()
+            await self.bus.publish("firewall_event", {
+                "type": "rule_added",
+                "rule": self.simple_rules[f"ip:{ip}"]
+            })
+            await self.bus.publish("explanation", {
+                "explanation": f"Firewall blocked IP {ip}. Reason: {reason}"
+            })
+        return {"status": "blocked", "ip": ip}
+
+    async def unblock_ip(self, ip: str):
+        if ip in self.blocked_ips:
+            self.blocked_ips.remove(ip)
+            
+            await self._execute_netsh(f"netsh advfirewall firewall delete rule name=\"Sentinel_Block_IP_{ip}\"")
+
+            if f"ip:{ip}" in self.simple_rules:
+                del self.simple_rules[f"ip:{ip}"]
+            
+            self.save_rules()
+            await self.bus.publish("firewall_event", {
+                "type": "rule_removed",
+                "target": ip,
+                "rule_type": "IP"
+            })
+            await self.bus.publish("explanation", {
+                "explanation": f"Firewall unblocked IP {ip}."
+            })
+        return {"status": "unblocked", "ip": ip}
+
+    async def block_country(self, country_code: str):
+        if country_code not in self.blocked_countries:
+            self.blocked_countries.add(country_code)
+            self.simple_rules[f"country:{country_code}"] = {
+                "target": country_code,
+                "type": "Country",
+                "reason": "Geo-Blocking Policy",
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            self.save_rules()
+            await self.bus.publish("firewall_event", {
+                "type": "rule_added",
+                "rule": self.simple_rules[f"country:{country_code}"]
+            })
+            await self.bus.publish("explanation", {
+                "explanation": f"Firewall blocked Country {country_code}."
+            })
+        return {"status": "blocked", "country": country_code}
+
+    async def unblock_country(self, country_code: str):
+        if country_code in self.blocked_countries:
+            self.blocked_countries.remove(country_code)
+            if f"country:{country_code}" in self.simple_rules:
+                del self.simple_rules[f"country:{country_code}"]
+            
+            self.save_rules()
+            await self.bus.publish("firewall_event", {
+                "type": "rule_removed",
+                "target": country_code,
+                "rule_type": "Country"
+            })
+        return {"status": "unblocked", "country": country_code}
+
+    async def block_port(self, port: int, reason: str = "Manual Block"):
+        if port not in self.blocked_ports:
+            self.blocked_ports.add(port)
+            
+            # Execute Native Windows Block (Best Effort)
+            cmd1 = f"netsh advfirewall firewall add rule name=\"Sentinel_Block_Port_{port}\" dir=in action=block protocol=TCP localport={port}"
+            await self._execute_netsh(cmd1)
+            cmd2 = f"netsh advfirewall firewall add rule name=\"Sentinel_Block_Port_{port}_UDP\" dir=in action=block protocol=UDP localport={port}"
+            await self._execute_netsh(cmd2)
+            
+            self.simple_rules[f"port:{port}"] = {
+                "target": port,
+                "type": "Port",
+                "reason": reason,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            self.save_rules()
+            await self.bus.publish("firewall_event", {
+                "type": "rule_added",
+                "rule": self.simple_rules[f"port:{port}"]
+            })
+            await self.bus.publish("explanation", {
+                "explanation": f"Firewall blocked Port {port}. Reason: {reason}"
+            })
+        return {"status": "blocked", "port": port}
+
+    async def unblock_port(self, port: int):
+        if port in self.blocked_ports:
+            self.blocked_ports.remove(port)
+            
+            await self._execute_netsh(f"netsh advfirewall firewall delete rule name=\"Sentinel_Block_Port_{port}\"")
+            await self._execute_netsh(f"netsh advfirewall firewall delete rule name=\"Sentinel_Block_Port_{port}_UDP\"")
+
+            if f"port:{port}" in self.simple_rules:
+                del self.simple_rules[f"port:{port}"]
+                
+            self.save_rules()
+            await self.bus.publish("firewall_event", {
+                "type": "rule_removed",
+                "target": port,
+                "rule_type": "Port"
+            })
+        return {"status": "unblocked", "port": port}
+
+    def get_status(self):
+        return {
+            "active": self.active,
+            "auto_block": self.auto_block_enabled,
+            "panic_mode": self.panic_mode,
+            "blocked_ips": list(self.blocked_ips),
+            "blocked_ports": list(self.blocked_ports),
+            "blocked_countries": list(self.blocked_countries),
+            "rules": list(self.simple_rules.values()),
+            "policies": self.ngfw.get_rules_dict()
+        }

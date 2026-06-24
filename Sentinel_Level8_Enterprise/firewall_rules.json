@@ -1,0 +1,59 @@
+{
+    "active": true,
+    "auto_block_enabled": true,
+    "panic_mode": false,
+    "blocked_ips": [],
+    "blocked_ports": [],
+    "blocked_countries": [],
+    "simple_rules": {},
+    "policies": [
+        {
+            "id": "262a4c45-ef03-421c-afe4-8155cb535e93",
+            "name": "Block Untrusted Processes",
+            "source_zone": "Untrust",
+            "dest_zone": "Any",
+            "source_ip": "Any",
+            "app": "Any",
+            "process_name": "any",
+            "action": "deny",
+            "hits": 0,
+            "created_at": "2026-06-17T02:29:02.972706"
+        },
+        {
+            "id": "94e49fcd-7215-45ff-adb6-ea7448f7dd7c",
+            "name": "Allow Web Traffic",
+            "source_zone": "Trust",
+            "dest_zone": "Untrust",
+            "source_ip": "Any",
+            "app": "web-browsing",
+            "process_name": "any",
+            "action": "allow",
+            "hits": 0,
+            "created_at": "2026-06-17T02:29:02.972706"
+        },
+        {
+            "id": "3ba21e53-7214-4fad-90f2-8e9115721e9e",
+            "name": "Isolate Critical Apps",
+            "source_zone": "Any",
+            "dest_zone": "DMZ",
+            "source_ip": "Any",
+            "app": "Any",
+            "process_name": "any",
+            "action": "deny",
+            "hits": 0,
+            "created_at": "2026-06-17T02:29:02.972706"
+        },
+        {
+            "id": "f7239ed9-d0e4-4d67-969c-1b51bbcd0b6f",
+            "name": "Default Allow LAN",
+            "source_zone": "Trust",
+            "dest_zone": "Trust",
+            "source_ip": "Any",
+            "app": "Any",
+            "process_name": "any",
+            "action": "allow",
+            "hits": 0,
+            "created_at": "2026-06-17T02:29:02.972706"
+        }
+    ]
+}

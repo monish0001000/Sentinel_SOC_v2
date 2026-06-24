@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+websockets
+psutil
+numpy>=1.25.2,<2.0.0
+scipy==1.16.0
+scikit-learn==1.7.1
+rich
+redis
+scapy
+watchdog
+python-jose[cryptography]
+passlib[bcrypt]
+bcrypt==3.2.0
+python-multipart
+requests

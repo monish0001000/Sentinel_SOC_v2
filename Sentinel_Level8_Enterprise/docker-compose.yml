@@ -1,0 +1,68 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - sentinel_net
+
+  c2_core:
+    build: .
+    command: python main.py
+    volumes:
+      - ./c2_core:/app
+    ports:
+      - "8000:8000" # API
+      - "8765:8765" # WebSocket C2
+    environment:
+      - REDIS_HOST=redis
+      - ROLE=c2
+    depends_on:
+      - redis
+    networks:
+      - sentinel_net
+
+  siem_vault:
+    build: .
+    command: python verify_siem_integrity.py # For now, running the verification loop or worker
+    volumes:
+      - ./siem_vault:/app
+    environment:
+      - REDIS_HOST=redis
+      - ROLE=siem
+    depends_on:
+      - redis
+    networks:
+      - sentinel_net
+
+  soar_engine:
+    build: .
+    command: python verify_adaptive_soar.py
+    volumes:
+      - ./soar_engine:/app
+    environment:
+      - REDIS_HOST=redis
+      - ROLE=soar
+    depends_on:
+      - redis
+    networks:
+      - sentinel_net
+
+  ai_brain:
+    build: .
+    command: python verify_prediction.py
+    volumes:
+      - ./ai_brain:/app
+    environment:
+      - REDIS_HOST=redis
+      - ROLE=ai
+    depends_on:
+      - redis
+    networks:
+      - sentinel_net
+
+networks:
+  sentinel_net:
+    driver: bridge
